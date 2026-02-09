@@ -40,6 +40,61 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
+def veld_select_experts(
+    weighted_ca: torch.Tensor,
+    reap_scores: torch.Tensor,
+    n_keep: int,
+    lam: float = 1e-4,
+) -> torch.Tensor:
+    """Greedy log-det selection on augmented Gram: G[i,j] = w_i·w_j + δ_{ij}·σ_i²."""
+    K = weighted_ca.shape[0]
+    device = weighted_ca.device
+    dtype = torch.float64
+
+    weighted_ca = weighted_ca.to(dtype)
+    reap_scores = reap_scores.to(dtype)
+
+    w_norms_sq = torch.sum(weighted_ca ** 2, dim=-1)
+    sigma_sq = torch.clamp(reap_scores ** 2 - w_norms_sq, min=0.0)
+
+    gram = weighted_ca @ weighted_ca.T
+    gram.diagonal().add_(sigma_sq)
+
+    # Greedy: pick expert with max Schur complement gain each step
+    selected: list[int] = []
+    remaining = set(range(K))
+    L_inv = torch.empty(0, 0, device=device, dtype=dtype)
+
+    for _ in range(n_keep):
+        best_idx = -1
+        best_gain = -float("inf")
+
+        for cand in remaining:
+            if not selected:
+                schur = lam + gram[cand, cand]
+            else:
+                s_idx = torch.tensor(selected, device=device, dtype=torch.long)
+                g_cs = gram[cand, s_idx]
+                schur = lam + gram[cand, cand] - g_cs @ L_inv @ g_cs
+
+            gain = torch.log(torch.clamp(schur, min=1e-30)).item()
+            if gain > best_gain:
+                best_gain = gain
+                best_idx = cand
+
+        selected.append(best_idx)
+        remaining.discard(best_idx)
+
+        s_idx = torch.tensor(selected, device=device, dtype=torch.long)
+        G_SS = gram[s_idx][:, s_idx]
+        L_inv = torch.linalg.inv(
+            lam * torch.eye(len(selected), device=device, dtype=dtype) + G_SS
+        )
+
+    pruned = sorted(set(range(K)) - set(selected))
+    return torch.tensor(pruned, device=device, dtype=torch.long)
+
+
 def dump_args_to_yaml(
     pruned_model_dir: pathlib.Path,
     reap_args: ReapArgs,
@@ -122,7 +177,23 @@ def prune(
 
     for layer in tqdm(observer_data, "Pruning layers..."):
         num_experts = observer_data[layer]["expert_frequency"].shape[0]
-        if prune_args.prune_method == "ean_ca":
+        if prune_args.prune_method == "veld":
+            weighted_ca = observer_data[layer].get("weighted_ca")
+            reap_scores = observer_data[layer].get("reap")
+            if weighted_ca is None or reap_scores is None:
+                raise ValueError(
+                    f"VELD pruning requires 'weighted_ca' and 'reap' in observer data "
+                    f"for layer {layer}. Available keys: {list(observer_data[layer].keys())}. "
+                    f"Re-run observer to collect weighted_ca."
+                )
+            n_keep = num_experts - n_experts_to_prune
+            experts_to_prune = veld_select_experts(
+                weighted_ca=weighted_ca,
+                reap_scores=reap_scores,
+                n_keep=n_keep,
+                lam=prune_args.veld_lambda,
+            )
+        elif prune_args.prune_method == "ean_ca":
             ean = torch.zeros(num_experts, device=model.device, dtype=torch.float32)
             for i in range(num_experts):
                 ean[i] = torch.linalg.norm(

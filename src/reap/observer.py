@@ -322,6 +322,14 @@ class MoETransformerObserver(BaseTransformerObserver):
             (num_experts,), device=device, dtype=torch.float32, requires_grad=False
         )
 
+        # VELD: w_i = E[g_i * f_i]
+        layer_state["weighted_ca"] = OnlineStatsTracker(
+            shape=(num_experts, hidden_dim),
+            count_shape=(num_experts, hidden_dim),
+            device=device,
+            dtype=torch.float32,
+        )
+
         return layer_state
 
     def _hook_factory(self, module: nn.Module, layer_number: int) -> callable:
@@ -488,6 +496,9 @@ class MoETransformerObserver(BaseTransformerObserver):
             weighted_expert_frequency_sum = torch.zeros(
                 num_experts, device=device, dtype=torch.float64
             )
+            weighted_ca = torch.zeros(
+                num_experts, hidden_dim, device=device, dtype=torch.float32
+            )
             routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float).to(
                 device
             )  # tok, num_experts
@@ -525,6 +536,11 @@ class MoETransformerObserver(BaseTransformerObserver):
                     (ean_norm * active_router_weights).mean().to(device)
                 )
 
+                weighted_ca[i] = (
+                    activations[i, active_mask, :]
+                    * active_router_weights.unsqueeze(-1)
+                ).sum(dim=0)
+
                 # super experts
                 selected_activations = activations[i, active_mask, :]
                 selected_activations_max = selected_activations.max().to(device="cpu")
@@ -547,10 +563,17 @@ class MoETransformerObserver(BaseTransformerObserver):
             )
 
             # weighted_expert_frequency_sum
-            
             self.state[layer_number]["weighted_expert_frequency_sum"] += (
                 weighted_expert_frequency_sum.to(device="cpu")
             )
+
+            expert_freq_expanded_wca = expert_frequency.unsqueeze(-1).expand(
+                (-1, hidden_dim)
+            )
+            self.state[layer_number]["weighted_ca"].update(
+                weighted_ca, expert_freq_expanded_wca
+            )
+            del expert_freq_expanded_wca
 
             # --- CLEAN UP -------------------------------------------------------------
             del (
@@ -560,6 +583,7 @@ class MoETransformerObserver(BaseTransformerObserver):
                 expert_frequency,
                 pairwise_expert_frequency,
                 prior_max_activations,
+                weighted_ca,
             )
             gc.collect()
 

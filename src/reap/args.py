@@ -498,9 +498,14 @@ class PruneArgs:
                 "weighted_ean_sum_l2",
                 "reap",
                 "reap_l2",
-                "max_activations"
+                "max_activations",
+                "veld",
             ]
         },
+    )
+    veld_lambda: float = field(
+        default=1e-4,
+        metadata={"help": "Regularization for VELD log-det objective."},
     )
     n_experts_to_prune: int | None = field(
         default=None,
